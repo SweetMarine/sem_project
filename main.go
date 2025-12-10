@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	_ "github.com/lib/pq"
@@ -78,7 +79,7 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 
 	var csvFile *zip.File
 	for _, f := range zipReader.File {
-		if f.Name == "test_data.csv" || f.Name == "data.csv" {
+		if strings.HasSuffix(f.Name, ".csv") {
 			csvFile = f
 			break
 		}
