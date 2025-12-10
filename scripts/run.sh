@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "[run.sh] Running server on :8080..."
-export PGHOST=localhost
-export PGPORT=5432
+echo "[run.sh] Setting PostgreSQL env..."
 export PGUSER=validator
 export PGPASSWORD=val1dat0r
+export PGHOST=localhost
+export PGPORT=5432
 export PGDATABASE=project-sem-1
 
-go run main.go &
+echo "[run.sh] Starting server on :8080..."
 
-SERVER_PID=$!
-echo "[run.sh] Server started with PID $SERVER_PID"
+go run main.go 2>&1 | tee server.log &
 
 sleep 3
