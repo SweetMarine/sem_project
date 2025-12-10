@@ -106,7 +106,6 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	expectedHeader := []string{"id", "name", "category", "price", "create_date"}
 	if len(header) != 5 {
 		http.Error(w, "wrong CSV fields count", http.StatusBadRequest)
 		return
