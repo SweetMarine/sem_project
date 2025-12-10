@@ -57,7 +57,6 @@ func pricesHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func handlePost(w http.ResponseWriter, r *http.Request) {
-	// read multipart file
 	file, _, err := r.FormFile("file")
 	if err != nil {
 		http.Error(w, "failed to read file", http.StatusBadRequest)
@@ -77,7 +76,6 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	//  data.csv
 	var csvFile *zip.File
 	for _, f := range zipReader.File {
 		if f.Name == "test_data.csv" || f.Name == "data.csv" {
@@ -99,13 +97,11 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 
 	reader := csv.NewReader(rc)
 
-	// читаем заголовок как в тесте
 	header, err := reader.Read()
 	if err != nil {
 		http.Error(w, "invalid csv header", http.StatusBadRequest)
 		return
 	}
-
 	if len(header) != 5 {
 		http.Error(w, "wrong CSV fields count", http.StatusBadRequest)
 		return
@@ -118,7 +114,7 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	stmt, err := tx.Prepare(`
-		INSERT INTO prices (product_id, name, category, price, created_at)
+		INSERT INTO prices (product_id, name, category, price, create_date)
 		VALUES ($1, $2, $3, $4, $5)
 	`)
 	if err != nil {
@@ -159,7 +155,6 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// агрегируем
 	var stats StatsResponse
 	row := db.QueryRow(`
 		SELECT
@@ -179,7 +174,7 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 
 func handleGet(w http.ResponseWriter, r *http.Request) {
 	rows, err := db.Query(`
-		SELECT product_id, name, category, price, created_at
+		SELECT product_id, name, category, price, create_date
 		FROM prices
 		ORDER BY product_id
 	`)
@@ -199,7 +194,6 @@ func handleGet(w http.ResponseWriter, r *http.Request) {
 	}
 
 	csvWriter := csv.NewWriter(f)
-
 	csvWriter.Write([]string{"id", "name", "category", "price", "create_date"})
 
 	for rows.Next() {
