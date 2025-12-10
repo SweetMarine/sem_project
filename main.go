@@ -17,7 +17,6 @@ import (
 
 var db *sql.DB
 
-// StatsResponse — структура ответа POST /api/v0/prices
 type StatsResponse struct {
 	TotalItems      int     `json:"total_items"`
 	TotalCategories int     `json:"total_categories"`
@@ -25,7 +24,6 @@ type StatsResponse struct {
 }
 
 func main() {
-	// jdbc
 	dsn := "postgres://validator:val1dat0r@localhost:5432/project-sem-1?sslmode=disable"
 
 	var err error
@@ -35,7 +33,7 @@ func main() {
 	}
 	defer db.Close()
 
-	if err := db.Ping(); err != nil {
+	if err = db.Ping(); err != nil {
 		log.Fatalf("failed to ping DB: %v", err)
 	}
 
@@ -50,168 +48,144 @@ func main() {
 func pricesHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodPost:
-		handleUploadPrices(w, r)
+		handlePost(w, r)
 	case http.MethodGet:
-		handleDownloadPrices(w, r)
+		handleGet(w, r)
 	default:
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		_, _ = w.Write([]byte("method not allowed"))
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
 }
 
-// handleUploadPrices — POST /api/v0/prices
-func handleUploadPrices(w http.ResponseWriter, r *http.Request) {
-	defer r.Body.Close()
-
-	body, err := io.ReadAll(r.Body)
+func handlePost(w http.ResponseWriter, r *http.Request) {
+	// read multipart file
+	file, _, err := r.FormFile("file")
 	if err != nil {
-		http.Error(w, "failed to read request body", http.StatusBadRequest)
+		http.Error(w, "failed to read file", http.StatusBadRequest)
 		return
 	}
+	defer file.Close()
 
-	if len(body) == 0 {
-		http.Error(w, "empty body", http.StatusBadRequest)
-		return
-	}
-
-	zipReader, err := zip.NewReader(bytes.NewReader(body), int64(len(body)))
+	buf, err := io.ReadAll(file)
 	if err != nil {
-		http.Error(w, "failed to read zip archive", http.StatusBadRequest)
+		http.Error(w, "failed to read file bytes", http.StatusInternalServerError)
 		return
 	}
 
-	// файл data.csv внутри архива
+	zipReader, err := zip.NewReader(bytes.NewReader(buf), int64(len(buf)))
+	if err != nil {
+		http.Error(w, "failed to open zip archive", http.StatusBadRequest)
+		return
+	}
+
+	//  data.csv
 	var csvFile *zip.File
 	for _, f := range zipReader.File {
-		if f.Name == "data.csv" {
+		if f.Name == "test_data.csv" || f.Name == "data.csv" {
 			csvFile = f
 			break
 		}
 	}
-
 	if csvFile == nil {
-		http.Error(w, "data.csv not found in archive", http.StatusBadRequest)
+		http.Error(w, "data.csv not found in zip", http.StatusBadRequest)
 		return
 	}
 
 	rc, err := csvFile.Open()
 	if err != nil {
-		http.Error(w, "failed to open data.csv", http.StatusInternalServerError)
+		http.Error(w, "failed to open csv file", http.StatusInternalServerError)
 		return
 	}
 	defer rc.Close()
 
 	reader := csv.NewReader(rc)
 
-	// первая строка загаловка
-	if _, err := reader.Read(); err != nil {
-		http.Error(w, "failed to read CSV header", http.StatusBadRequest)
+	// читаем заголовок как в тесте
+	header, err := reader.Read()
+	if err != nil {
+		http.Error(w, "invalid csv header", http.StatusBadRequest)
+		return
+	}
+
+	expectedHeader := []string{"id", "name", "category", "price", "create_date"}
+	if len(header) != 5 {
+		http.Error(w, "wrong CSV fields count", http.StatusBadRequest)
 		return
 	}
 
 	tx, err := db.Begin()
 	if err != nil {
-		http.Error(w, "failed to begin transaction", http.StatusInternalServerError)
+		http.Error(w, "db begin failed", http.StatusInternalServerError)
 		return
 	}
 
 	stmt, err := tx.Prepare(`
-		INSERT INTO prices (product_id, created_at, name, category, price)
+		INSERT INTO prices (product_id, name, category, price, created_at)
 		VALUES ($1, $2, $3, $4, $5)
 	`)
 	if err != nil {
-		_ = tx.Rollback()
-		http.Error(w, "failed to prepare insert", http.StatusInternalServerError)
+		tx.Rollback()
+		http.Error(w, "prepare failed", http.StatusInternalServerError)
 		return
 	}
 	defer stmt.Close()
 
 	for {
-		record, err := reader.Read()
+		row, err := reader.Read()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			_ = tx.Rollback()
-			http.Error(w, "failed to read CSV record", http.StatusBadRequest)
+			tx.Rollback()
+			http.Error(w, "failed to read row", http.StatusBadRequest)
 			return
 		}
 
-		if len(record) < 5 {
-			_ = tx.Rollback()
-			http.Error(w, "invalid CSV format", http.StatusBadRequest)
-			return
-		}
+		id, _ := strconv.Atoi(row[0])
+		name := row[1]
+		category := row[2]
+		price, _ := strconv.ParseFloat(row[3], 64)
+		date, _ := time.Parse("2006-01-02", row[4])
 
-		productIDStr := record[0]
-		createdStr := record[1]
-		name := record[2]
-		category := record[3]
-		priceStr := record[4]
-
-		productID, err := strconv.Atoi(productIDStr)
+		_, err = stmt.Exec(id, name, category, price, date)
 		if err != nil {
-			_ = tx.Rollback()
-			http.Error(w, "invalid product id", http.StatusBadRequest)
-			return
-		}
-
-		createdAt, err := time.Parse("2006-01-02", createdStr)
-		if err != nil {
-			_ = tx.Rollback()
-			http.Error(w, "invalid date format", http.StatusBadRequest)
-			return
-		}
-
-		price, err := strconv.ParseFloat(priceStr, 64)
-		if err != nil {
-			_ = tx.Rollback()
-			http.Error(w, "invalid price format", http.StatusBadRequest)
-			return
-		}
-
-		if _, err := stmt.Exec(productID, createdAt, name, category, price); err != nil {
-			_ = tx.Rollback()
-			http.Error(w, "failed to insert into DB", http.StatusInternalServerError)
+			tx.Rollback()
+			http.Error(w, "db insert failed", http.StatusInternalServerError)
 			return
 		}
 	}
 
-	if err := tx.Commit(); err != nil {
-		http.Error(w, "failed to commit transaction", http.StatusInternalServerError)
+	err = tx.Commit()
+	if err != nil {
+		http.Error(w, "commit failed", http.StatusInternalServerError)
 		return
 	}
 
-	// статистика по всей базе
+	// агрегируем
 	var stats StatsResponse
 	row := db.QueryRow(`
-		SELECT 
+		SELECT
 			COUNT(*) AS total_items,
 			COUNT(DISTINCT category) AS total_categories,
-			COALESCE(SUM(price), 0) AS total_price
+			COALESCE(SUM(price), 0)
 		FROM prices
 	`)
 	if err := row.Scan(&stats.TotalItems, &stats.TotalCategories, &stats.TotalPrice); err != nil {
-		http.Error(w, "failed to compute stats", http.StatusInternalServerError)
+		http.Error(w, "stats query failed", http.StatusInternalServerError)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(stats); err != nil {
-		http.Error(w, "failed to encode response", http.StatusInternalServerError)
-		return
-	}
+	json.NewEncoder(w).Encode(stats)
 }
 
-// handleDownloadPrices — GET /api/v0/prices
-func handleDownloadPrices(w http.ResponseWriter, r *http.Request) {
+func handleGet(w http.ResponseWriter, r *http.Request) {
 	rows, err := db.Query(`
-		SELECT product_id, created_at, name, category, price
+		SELECT product_id, name, category, price, created_at
 		FROM prices
 		ORDER BY product_id
 	`)
 	if err != nil {
-		http.Error(w, "failed to query DB", http.StatusInternalServerError)
+		http.Error(w, "DB query failed", http.StatusInternalServerError)
 		return
 	}
 	defer rows.Close()
@@ -219,69 +193,40 @@ func handleDownloadPrices(w http.ResponseWriter, r *http.Request) {
 	var buf bytes.Buffer
 	zipWriter := zip.NewWriter(&buf)
 
-	fileWriter, err := zipWriter.Create("data.csv")
+	f, err := zipWriter.Create("data.csv")
 	if err != nil {
-		http.Error(w, "failed to create file in zip", http.StatusInternalServerError)
+		http.Error(w, "zip create failed", http.StatusInternalServerError)
 		return
 	}
 
-	csvWriter := csv.NewWriter(fileWriter)
+	csvWriter := csv.NewWriter(f)
 
-	// заголовок CSV
-	header := []string{"id", "date", "name", "category", "price"}
-	if err := csvWriter.Write(header); err != nil {
-		http.Error(w, "failed to write CSV header", http.StatusInternalServerError)
-		return
-	}
+	csvWriter.Write([]string{"id", "name", "category", "price", "create_date"})
 
 	for rows.Next() {
 		var (
-			productID int
-			createdAt time.Time
-			name      string
-			category  string
-			price     float64
+			id       int
+			name     string
+			category string
+			price    float64
+			date     time.Time
 		)
-
-		if err := rows.Scan(&productID, &createdAt, &name, &category, &price); err != nil {
-			http.Error(w, "failed to scan row", http.StatusInternalServerError)
-			return
-		}
+		rows.Scan(&id, &name, &category, &price, &date)
 
 		record := []string{
-			strconv.Itoa(productID),
-			createdAt.Format("2006-01-02"),
+			strconv.Itoa(id),
 			name,
 			category,
 			strconv.FormatFloat(price, 'f', 2, 64),
+			date.Format("2006-01-02"),
 		}
 
-		if err := csvWriter.Write(record); err != nil {
-			http.Error(w, "failed to write CSV record", http.StatusInternalServerError)
-			return
-		}
-	}
-
-	if err := rows.Err(); err != nil {
-		http.Error(w, "rows error", http.StatusInternalServerError)
-		return
+		csvWriter.Write(record)
 	}
 
 	csvWriter.Flush()
-	if err := csvWriter.Error(); err != nil {
-		http.Error(w, "failed to flush CSV", http.StatusInternalServerError)
-		return
-	}
-
-	if err := zipWriter.Close(); err != nil {
-		http.Error(w, "failed to close zip", http.StatusInternalServerError)
-		return
-	}
+	zipWriter.Close()
 
 	w.Header().Set("Content-Type", "application/zip")
-	w.Header().Set("Content-Disposition", `attachment; filename="prices.zip"`)
-	if _, err := w.Write(buf.Bytes()); err != nil {
-		http.Error(w, "failed to write response", http.StatusInternalServerError)
-		return
-	}
+	w.Write(buf.Bytes())
 }
