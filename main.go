@@ -94,7 +94,6 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer rc.Close()
-
 	reader := csv.NewReader(rc)
 
 	header, err := reader.Read()
