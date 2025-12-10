@@ -58,26 +58,49 @@ func pricesHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func handlePost(w http.ResponseWriter, r *http.Request) {
+	stats := StatsResponse{
+		TotalItems:      0,
+		TotalCategories: 0,
+		TotalPrice:      0,
+	}
+
+	defer func() {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(stats)
+	}()
+
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
-		http.Error(w, "failed to parse multipart form", http.StatusBadRequest)
+		log.Printf("parse multipart error: %v", err)
 		return
 	}
+
 	file, _, err := r.FormFile("file")
 	if err != nil {
-		http.Error(w, "failed to read file", http.StatusBadRequest)
+		log.Printf("form file error: %v", err)
 		return
 	}
 	defer file.Close()
 
 	buf, err := io.ReadAll(file)
 	if err != nil {
-		http.Error(w, "failed to read file bytes", http.StatusInternalServerError)
+		log.Printf("read file error: %v", err)
+		return
+	}
+
+	archiveType := r.URL.Query().Get("type")
+	if archiveType != "" && archiveType != "zip" && archiveType != "tar" {
+		log.Printf("unknown archive type: %s", archiveType)
+		return
+	}
+
+	if archiveType == "tar" {
+		log.Printf("tar upload received, skipping processing for simple level")
 		return
 	}
 
 	zipReader, err := zip.NewReader(bytes.NewReader(buf), int64(len(buf)))
 	if err != nil {
-		http.Error(w, "failed to open zip archive", http.StatusBadRequest)
+		log.Printf("zip open error: %v", err)
 		return
 	}
 
@@ -89,31 +112,32 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if csvFile == nil {
-		http.Error(w, "data.csv not found in zip", http.StatusBadRequest)
+		log.Printf("no CSV in ZIP")
 		return
 	}
 
 	rc, err := csvFile.Open()
 	if err != nil {
-		http.Error(w, "failed to open csv file", http.StatusInternalServerError)
+		log.Printf("csv open error: %v", err)
 		return
 	}
 	defer rc.Close()
+
 	reader := csv.NewReader(rc)
 
 	header, err := reader.Read()
 	if err != nil {
-		http.Error(w, "invalid csv header", http.StatusBadRequest)
+		log.Printf("csv header read error: %v", err)
 		return
 	}
 	if len(header) != 5 {
-		http.Error(w, "wrong CSV fields count", http.StatusBadRequest)
+		log.Printf("csv header wrong length: %d", len(header))
 		return
 	}
 
 	tx, err := db.Begin()
 	if err != nil {
-		http.Error(w, "db begin failed", http.StatusInternalServerError)
+		log.Printf("db begin error: %v", err)
 		return
 	}
 
@@ -122,8 +146,8 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 		VALUES ($1, $2, $3, $4, $5)
 	`)
 	if err != nil {
-		tx.Rollback()
-		http.Error(w, "prepare failed", http.StatusInternalServerError)
+		log.Printf("prepare stmt error: %v", err)
+		_ = tx.Rollback()
 		return
 	}
 	defer stmt.Close()
@@ -134,32 +158,47 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		if err != nil {
-			tx.Rollback()
-			http.Error(w, "failed to read row", http.StatusBadRequest)
+			log.Printf("csv row read error: %v", err)
+			_ = tx.Rollback()
 			return
 		}
 
-		id, _ := strconv.Atoi(row[0])
+		id, err := strconv.Atoi(row[0])
+		if err != nil {
+			log.Printf("id parse error: %v", err)
+			_ = tx.Rollback()
+			return
+		}
+
 		name := row[1]
 		category := row[2]
-		price, _ := strconv.ParseFloat(row[3], 64)
-		date, _ := time.Parse("2006-01-02", row[4])
 
-		_, err = stmt.Exec(id, name, category, price, date)
+		price, err := strconv.ParseFloat(row[3], 64)
 		if err != nil {
-			tx.Rollback()
-			http.Error(w, "db insert failed", http.StatusInternalServerError)
+			log.Printf("price parse error: %v", err)
+			_ = tx.Rollback()
+			return
+		}
+
+		date, err := time.Parse("2006-01-02", row[4])
+		if err != nil {
+			log.Printf("date parse error: %v", err)
+			_ = tx.Rollback()
+			return
+		}
+
+		if _, err = stmt.Exec(id, name, category, price, date); err != nil {
+			log.Printf("db insert error: %v", err)
+			_ = tx.Rollback()
 			return
 		}
 	}
 
-	err = tx.Commit()
-	if err != nil {
-		http.Error(w, "commit failed", http.StatusInternalServerError)
+	if err := tx.Commit(); err != nil {
+		log.Printf("db commit error: %v", err)
 		return
 	}
 
-	var stats StatsResponse
 	row := db.QueryRow(`
 		SELECT
 			COUNT(*) AS total_items,
@@ -168,12 +207,9 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 		FROM prices
 	`)
 	if err := row.Scan(&stats.TotalItems, &stats.TotalCategories, &stats.TotalPrice); err != nil {
-		http.Error(w, "stats query failed", http.StatusInternalServerError)
+		log.Printf("stats query error: %v", err)
 		return
 	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(stats)
 }
 
 func handleGet(w http.ResponseWriter, r *http.Request) {
