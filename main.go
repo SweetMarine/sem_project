@@ -64,19 +64,18 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 		TotalPrice:      0,
 	}
 
-	defer func() {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(stats)
-	}()
+	w.Header().Set("Content-Type", "application/json")
 
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
 		log.Printf("parse multipart error: %v", err)
+		json.NewEncoder(w).Encode(stats)
 		return
 	}
 
 	file, _, err := r.FormFile("file")
 	if err != nil {
 		log.Printf("form file error: %v", err)
+		json.NewEncoder(w).Encode(stats)
 		return
 	}
 	defer file.Close()
@@ -84,23 +83,27 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 	buf, err := io.ReadAll(file)
 	if err != nil {
 		log.Printf("read file error: %v", err)
+		json.NewEncoder(w).Encode(stats)
 		return
 	}
 
 	archiveType := r.URL.Query().Get("type")
 	if archiveType != "" && archiveType != "zip" && archiveType != "tar" {
 		log.Printf("unknown archive type: %s", archiveType)
+		json.NewEncoder(w).Encode(stats)
 		return
 	}
 
 	if archiveType == "tar" {
 		log.Printf("tar upload received, skipping processing for simple level")
+		json.NewEncoder(w).Encode(stats)
 		return
 	}
 
 	zipReader, err := zip.NewReader(bytes.NewReader(buf), int64(len(buf)))
 	if err != nil {
 		log.Printf("zip open error: %v", err)
+		json.NewEncoder(w).Encode(stats)
 		return
 	}
 
@@ -113,12 +116,14 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 	}
 	if csvFile == nil {
 		log.Printf("no CSV in ZIP")
+		json.NewEncoder(w).Encode(stats)
 		return
 	}
 
 	rc, err := csvFile.Open()
 	if err != nil {
 		log.Printf("csv open error: %v", err)
+		json.NewEncoder(w).Encode(stats)
 		return
 	}
 	defer rc.Close()
@@ -128,16 +133,19 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 	header, err := reader.Read()
 	if err != nil {
 		log.Printf("csv header read error: %v", err)
+		json.NewEncoder(w).Encode(stats)
 		return
 	}
 	if len(header) != 5 {
 		log.Printf("csv header wrong length: %d", len(header))
+		json.NewEncoder(w).Encode(stats)
 		return
 	}
 
 	tx, err := db.Begin()
 	if err != nil {
 		log.Printf("db begin error: %v", err)
+		json.NewEncoder(w).Encode(stats)
 		return
 	}
 
@@ -148,6 +156,7 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		log.Printf("prepare stmt error: %v", err)
 		_ = tx.Rollback()
+		json.NewEncoder(w).Encode(stats)
 		return
 	}
 	defer stmt.Close()
@@ -160,23 +169,31 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			log.Printf("csv row read error: %v", err)
 			_ = tx.Rollback()
+			json.NewEncoder(w).Encode(stats)
 			return
+		}
+
+		if len(row) != 5 {
+			log.Printf("csv row wrong length: %d", len(row))
+			continue
 		}
 
 		id, err := strconv.Atoi(row[0])
 		if err != nil {
 			log.Printf("id parse error: %v", err)
 			_ = tx.Rollback()
+			json.NewEncoder(w).Encode(stats)
 			return
 		}
 
-		name := row[1]
-		category := row[2]
+		name := strings.TrimSpace(row[1])
+		category := strings.TrimSpace(row[2])
 
 		price, err := strconv.ParseFloat(row[3], 64)
 		if err != nil {
 			log.Printf("price parse error: %v", err)
 			_ = tx.Rollback()
+			json.NewEncoder(w).Encode(stats)
 			return
 		}
 
@@ -184,18 +201,21 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			log.Printf("date parse error: %v", err)
 			_ = tx.Rollback()
+			json.NewEncoder(w).Encode(stats)
 			return
 		}
 
 		if _, err = stmt.Exec(id, name, category, price, date); err != nil {
 			log.Printf("db insert error: %v", err)
 			_ = tx.Rollback()
+			json.NewEncoder(w).Encode(stats)
 			return
 		}
 	}
 
 	if err := tx.Commit(); err != nil {
 		log.Printf("db commit error: %v", err)
+		json.NewEncoder(w).Encode(stats)
 		return
 	}
 
@@ -203,13 +223,16 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 		SELECT
 			COUNT(*) AS total_items,
 			COUNT(DISTINCT category) AS total_categories,
-			COALESCE(SUM(price), 0)
+			COALESCE(SUM(price), 0) AS total_price
 		FROM prices
 	`)
 	if err := row.Scan(&stats.TotalItems, &stats.TotalCategories, &stats.TotalPrice); err != nil {
 		log.Printf("stats query error: %v", err)
+		json.NewEncoder(w).Encode(stats)
 		return
 	}
+
+	json.NewEncoder(w).Encode(stats)
 }
 
 func handleGet(w http.ResponseWriter, r *http.Request) {
@@ -244,7 +267,11 @@ func handleGet(w http.ResponseWriter, r *http.Request) {
 			price    float64
 			date     time.Time
 		)
-		rows.Scan(&id, &name, &category, &price, &date)
+		if err := rows.Scan(&id, &name, &category, &price, &date); err != nil {
+			log.Printf("row scan error: %v", err)
+			http.Error(w, "DB scan failed", http.StatusInternalServerError)
+			return
+		}
 
 		record := []string{
 			strconv.Itoa(id),
@@ -255,6 +282,12 @@ func handleGet(w http.ResponseWriter, r *http.Request) {
 		}
 
 		csvWriter.Write(record)
+	}
+
+	if err := rows.Err(); err != nil {
+		log.Printf("rows error: %v", err)
+		http.Error(w, "DB rows error", http.StatusInternalServerError)
+		return
 	}
 
 	csvWriter.Flush()
