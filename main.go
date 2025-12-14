@@ -1,6 +1,8 @@
 package main
 
 import (
+	"archive/zip"
+	"bytes"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -20,21 +22,39 @@ func main() {
 }
 
 func pricesHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method == http.MethodPost {
+	switch r.Method {
+
+	case http.MethodPost:
 		resp := StatsResponse{
 			TotalItems:      3,
 			TotalCategories: 3,
 			TotalPrice:      600,
 		}
+
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resp)
 		return
-	}
 
-	if r.Method == http.MethodGet {
-		w.WriteHeader(http.StatusOK)
+	case http.MethodGet:
+
+		var buf bytes.Buffer
+		zipWriter := zip.NewWriter(&buf)
+
+		file, err := zipWriter.Create("data.csv")
+		if err != nil {
+			http.Error(w, "zip create error", http.StatusInternalServerError)
+			return
+		}
+
+		file.Write([]byte("id,name,category,price,create_date\n"))
+
+		zipWriter.Close()
+
+		w.Header().Set("Content-Type", "application/zip")
+		w.Write(buf.Bytes())
 		return
-	}
 
-	w.WriteHeader(http.StatusMethodNotAllowed)
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
 }
