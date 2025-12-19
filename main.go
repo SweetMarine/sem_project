@@ -19,9 +19,19 @@ import (
 )
 
 type StatsResponse struct {
-	TotalItems      int     `json:"total_items"`
-	TotalCategories int     `json:"total_categories"`
-	TotalPrice      float64 `json:"total_price"`
+	// Количество успешно добавленных элементов в текущей загрузке
+	TotalItems int `json:"total_items"`
+	// Общее количество категорий по всей БД
+	TotalCategories int `json:"total_categories"`
+	// Суммарная стоимость по всей БД
+	TotalPrice float64 `json:"total_price"`
+}
+
+type priceRow struct {
+	Name     string
+	Category string
+	Price    float64
+	Date     time.Time
 }
 
 func main() {
@@ -29,7 +39,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to open DB: %v", err)
 	}
-	defer db.Close()
+	defer func() {
+		if cerr := db.Close(); cerr != nil {
+			log.Printf("failed to close DB: %v", cerr)
+		}
+	}()
 
 	if err := db.Ping(); err != nil {
 		log.Fatalf("failed to ping DB: %v", err)
@@ -39,7 +53,10 @@ func main() {
 	mux.HandleFunc("/api/v0/prices", pricesHandler(db))
 
 	log.Println("server is listening on :8080")
-	log.Fatal(http.ListenAndServe(":8080", mux))
+
+	if err := http.ListenAndServe(":8080", mux); err != nil {
+		log.Printf("server stopped with error: %v", err)
+	}
 }
 
 func openDBFromEnv() (*sql.DB, error) {
@@ -123,29 +140,13 @@ func handlePost(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 
 	reader := csv.NewReader(rc)
 
-	// read header and ignore (data корректны по ТЗ)
+	// header
 	if _, err := reader.Read(); err != nil {
 		http.Error(w, "failed to read csv header", http.StatusBadRequest)
 		return
 	}
 
-	tx, err := db.Begin()
-	if err != nil {
-		http.Error(w, "db begin failed", http.StatusInternalServerError)
-		return
-	}
-	defer tx.Rollback()
-
-	stmt, err := tx.Prepare(`INSERT INTO prices (id, name, category, price, create_date) VALUES ($1,$2,$3,$4,$5)`)
-	if err != nil {
-		http.Error(w, "prepare failed", http.StatusInternalServerError)
-		return
-	}
-	defer stmt.Close()
-
-	totalItems := 0
-	totalPrice := 0.0
-	categories := make(map[string]struct{})
+	rowsData := make([]priceRow, 0, 128)
 
 	for {
 		rec, err := reader.Read()
@@ -161,11 +162,6 @@ func handlePost(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		id, err := strconv.Atoi(strings.TrimSpace(rec[0]))
-		if err != nil {
-			http.Error(w, "invalid id", http.StatusBadRequest)
-			return
-		}
 		name := strings.TrimSpace(rec[1])
 		category := strings.TrimSpace(rec[2])
 
@@ -181,14 +177,50 @@ func handlePost(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if _, err := stmt.Exec(id, name, category, price, dt); err != nil {
+		rowsData = append(rowsData, priceRow{
+			Name:     name,
+			Category: category,
+			Price:    price,
+			Date:     dt,
+		})
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		http.Error(w, "db begin failed", http.StatusInternalServerError)
+		return
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	stmt, err := tx.Prepare(`INSERT INTO prices (name, category, price, create_date) VALUES ($1,$2,$3,$4)`)
+	if err != nil {
+		http.Error(w, "prepare failed", http.StatusInternalServerError)
+		return
+	}
+	defer stmt.Close()
+
+	inserted := 0
+	for _, row := range rowsData {
+		if _, err := stmt.Exec(row.Name, row.Category, row.Price, row.Date); err != nil {
 			http.Error(w, "db insert failed", http.StatusInternalServerError)
 			return
 		}
+		inserted++
+	}
 
-		totalItems++
-		totalPrice += price
-		categories[category] = struct{}{}
+	var totalCategories int
+	var totalPrice float64
+
+	if err := tx.QueryRow(`
+		SELECT
+			COUNT(DISTINCT category) AS total_categories,
+			COALESCE(SUM(price), 0)  AS total_price
+		FROM prices
+	`).Scan(&totalCategories, &totalPrice); err != nil {
+		http.Error(w, "stats query failed", http.StatusInternalServerError)
+		return
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -197,17 +229,19 @@ func handlePost(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := StatsResponse{
-		TotalItems:      totalItems,
-		TotalCategories: len(categories),
+		TotalItems:      inserted,
+		TotalCategories: totalCategories,
 		TotalPrice:      totalPrice,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(resp)
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		log.Printf("failed to write json response: %v", err)
+	}
 }
 
 func handleGet(db *sql.DB, w http.ResponseWriter, r *http.Request) {
-	// Берём все записи из БД
+	// sql все записи из БД
 	rows, err := db.Query(`
 		SELECT id, name, category, price::text, create_date::text
 		FROM prices
@@ -229,7 +263,10 @@ func handleGet(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 	}
 
 	cw := csv.NewWriter(f)
-	_ = cw.Write([]string{"id", "name", "category", "price", "create_date"})
+	if err := cw.Write([]string{"id", "name", "category", "price", "create_date"}); err != nil {
+		http.Error(w, "csv write failed", http.StatusInternalServerError)
+		return
+	}
 
 	for rows.Next() {
 		var (
@@ -243,8 +280,18 @@ func handleGet(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "row scan failed", http.StatusInternalServerError)
 			return
 		}
-		_ = cw.Write([]string{strconv.Itoa(id), name, category, priceTxt, dateTxt})
+
+		if err := cw.Write([]string{strconv.Itoa(id), name, category, priceTxt, dateTxt}); err != nil {
+			http.Error(w, "csv write failed", http.StatusInternalServerError)
+			return
+		}
 	}
+
+	if err := rows.Err(); err != nil {
+		http.Error(w, "rows iteration failed", http.StatusInternalServerError)
+		return
+	}
+
 	cw.Flush()
 	if err := cw.Error(); err != nil {
 		http.Error(w, "csv write failed", http.StatusInternalServerError)
@@ -257,5 +304,7 @@ func handleGet(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/zip")
-	w.Write(zipBuf.Bytes())
+	if _, err := w.Write(zipBuf.Bytes()); err != nil {
+		log.Printf("failed to write zip response: %v", err)
+	}
 }
